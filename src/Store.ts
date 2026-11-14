@@ -148,8 +148,11 @@ export class Store extends Context.Service<
   {
     getDigestRow(date: string): Effect.Effect<DigestRow | null>;
     saveSnapshot(date: string, snapshot: Snapshot): Effect.Effect<void>;
-    /** Saves the finished digest and marks its stories as seen, atomically. */
-    saveDigest(date: string, digest: Digest): Effect.Effect<void>;
+    /**
+     * Saves the finished digest and, unless `markSeen` is false, marks its stories as seen,
+     * atomically. A manual send passes false so the scheduled digest can still include them.
+     */
+    saveDigest(date: string, digest: Digest, options?: { readonly markSeen?: boolean }): Effect.Effect<void>;
     /** `messageId` goes in the old `email_id` column, which held Resend's id before. */
     markSent(date: string, messageId: string, at: number): Effect.Effect<void>;
     recordFailure(date: string, at: number, error: string): Effect.Effect<number>;
@@ -225,11 +228,12 @@ export class Store extends Context.Service<
             yield* sql`UPDATE digests SET snapshot = ${encoded} WHERE date = ${date}`;
           }).pipe(Effect.orDie),
 
-        saveDigest: (date, digest) =>
+        saveDigest: (date, digest, options) =>
           Effect.gen(function* () {
             const encoded = yield* encodeDigest(digest);
             yield* upsertRow(date);
             yield* sql`UPDATE digests SET digest = ${encoded}, status = 'ready' WHERE date = ${date}`;
+            if (options?.markSeen === false) return;
             for (const story of digest.stories) {
               yield* sql`
                 INSERT INTO digest_stories (story_id, digest_date) VALUES (${story.id}, ${date})

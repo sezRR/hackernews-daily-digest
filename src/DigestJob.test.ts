@@ -487,3 +487,70 @@ describe("runWithRetries", () => {
     }).pipe(Effect.provide(h.layer));
   });
 });
+
+describe("sendManually", () => {
+  it.effect("sends even after today's digest went out, and leaves today's digest as it was", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(NOV_5_09_00);
+      const job = yield* DigestJob;
+      yield* job.run("2026-11-05");
+
+      const result = yield* job.sendManually;
+
+      assert.strictEqual(h.mail.sent.length, 2);
+      // Stories already in today's digest are included: it's the front page as it is now.
+      assert.strictEqual(result.stories, 1);
+      assert.include(h.mail.sent[1]?.email.html ?? "", "Story one");
+      assert.strictEqual(yield* job.run("2026-11-05"), "already-sent");
+      assert.strictEqual(h.mail.sent.length, 2);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("before the scheduled run, marks nothing as sent or seen, so 07:30 still sends in full", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(NOV_5_09_00);
+      const job = yield* DigestJob;
+      const store = yield* Store;
+
+      yield* job.sendManually;
+
+      assert.isNull(yield* store.getDigestRow("2026-11-05"));
+      assert.strictEqual((yield* store.seenStoryIds([1])).size, 0);
+      assert.strictEqual(yield* job.run("2026-11-05"), "sent");
+      assert.include(h.mail.sent[1]?.email.html ?? "", "Story one");
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("replies to it continue a conversation about that email's own stories", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(NOV_5_09_00);
+      const job = yield* DigestJob;
+      const store = yield* Store;
+
+      const { thread } = yield* job.sendManually;
+
+      assert.strictEqual(thread, "2026-11-05 manual 09:00");
+      const messageId = h.mail.sent[0]?.threading.messageId ?? "";
+      assert.deepStrictEqual(yield* store.findOutgoing([messageId]), new Map([[messageId, thread]]));
+      assert.strictEqual((yield* store.getDigestRow(thread))?.digest?.stories[0]?.title, "Story one");
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a failure is returned once, with no retry, alert or effect on today's attempts", () => {
+    const h = harness({ mailFailures: ["smtp down"] });
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(NOV_5_09_00);
+      const job = yield* DigestJob;
+      const store = yield* Store;
+
+      const error = yield* job.sendManually.pipe(Effect.flip);
+
+      assert.strictEqual(error._tag, "MailError");
+      assert.strictEqual(h.mail.sent.length, 0);
+      assert.isNull(yield* store.getDigestRow("2026-11-05"));
+    }).pipe(Effect.provide(h.layer));
+  });
+});

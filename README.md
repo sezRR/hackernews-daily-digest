@@ -29,7 +29,7 @@ nano .env
 # 2. Build, and start the reply reader.
 make deploy
 
-# 3. Send today's digest now, to check the keys.
+# 3. Send a digest now, to check the keys. It doesn't replace the scheduled one.
 make run
 
 # 4. Schedule the digest. Asks for sudo once, to create /var/log/hn-digest.log.
@@ -50,7 +50,7 @@ Plain `make` lists every command:
 | `make deploy` | Pull (if it's a git checkout), rebuild, restart the reply reader |
 | `make start` / `stop` / `restart` | Control the reply reader. Restart after editing `.env`. |
 | `make status` | Reply reader state, the cron entry, and the last digest runs |
-| `make run` | Send today's digest now, with retries, printing to the terminal. Skips if already sent today. |
+| `make run` | Send a digest of the front page as it is now, always. It doesn't count as today's: nothing is marked sent or seen, so the scheduled digest still goes out in full. Tried once, errors print to the terminal. Replies to it are answered. |
 | `make cron-set` / `cron-list` / `cron-remove` | Manage the crontab entry. Other entries in your crontab are left alone. |
 | `make log-file` | Create `/var/log/hn-digest.log`, owned by you. `cron-set` runs it for you. |
 | `make logs` | Recent lines from both logs |
@@ -111,7 +111,7 @@ Test emails start with `[test]` and use a separate database, `data/dev.db`, whic
 
 **Failures.** Each stage of the digest is saved, so a retry continues where the last attempt stopped: a failed send doesn't pay for another model call. After a failure, the same run waits 30 minutes and tries again, up to 4 attempts. Then it emails you the error and stops until tomorrow. A retry reuses the same Message-ID, so if an earlier attempt did go out, Gmail usually drops the second copy.
 
-**Missed runs.** If the server is down at `DIGEST_TIME`, that day's digest is skipped. Run `make run` to send it late.
+**Missed runs.** If the server is down at `DIGEST_TIME`, that day's digest is skipped. `make run` sends one late. Because it's a manual send, its stories can turn up again in the next scheduled digest.
 
 **Cost.** Once `CHAT_DAILY_TOKEN_LIMIT` is reached, replies get a short "budget used up" answer until midnight UTC. Digests don't count toward the limit.
 

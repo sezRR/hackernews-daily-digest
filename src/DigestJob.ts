@@ -132,6 +132,12 @@ export class DigestJob extends Context.Service<
      * stops for the day. Never fails: every problem is logged.
      */
     runWithRetries(date: string): Effect.Effect<RunOutcome>;
+    /**
+     * `make run`: builds a digest from the front page as it is now and sends it, even if
+     * today's was already sent. It doesn't count as today's digest: nothing is marked sent or
+     * seen, so the scheduled digest still goes out in full. Tried once; errors are returned.
+     */
+    readonly sendManually: Effect.Effect<{ readonly thread: string; readonly stories: number }, RunError>;
   }
 >()("hackernews-mcp/DigestJob") {
   static readonly layer = Layer.effect(
@@ -143,10 +149,13 @@ export class DigestJob extends Context.Service<
       const mailer = yield* Mailer;
       const store = yield* Store;
 
-      const fetchSnapshot = Effect.fn("DigestJob.fetchSnapshot")(function* (date: string) {
+      /** Reads the front page and the selected threads. `skipSeen` drops stories already sent. */
+      const collectSnapshot = Effect.fn("DigestJob.collectSnapshot")(function* (skipSeen: boolean) {
         const now = yield* Clock.currentTimeMillis;
         const frontPage = yield* hackerNews.getFrontPage(FRONT_PAGE_PARAMS);
-        const seen = yield* store.seenStoryIds(frontPage.stories.map((story) => story.id));
+        const seen = skipSeen
+          ? yield* store.seenStoryIds(frontPage.stories.map((story) => story.id))
+          : new Set<number>();
         const selected = selectStories(frontPage.stories, seen, now, config);
 
         const results = yield* Effect.forEach(
@@ -172,11 +181,17 @@ export class DigestJob extends Context.Service<
             (results.length - threads.length),
           threads,
         };
+        return snapshot;
+      });
+
+      const fetchSnapshot = Effect.fn("DigestJob.fetchSnapshot")(function* (date: string) {
+        const snapshot = yield* collectSnapshot(true);
         yield* store.saveSnapshot(date, snapshot);
         return snapshot;
       });
 
-      const analyze = Effect.fn("DigestJob.analyze")(function* (date: string, snapshot: Snapshot) {
+      /** One model call, no tools. Records the tokens it used under `date`. */
+      const buildDigest = Effect.fn("DigestJob.buildDigest")(function* (date: string, snapshot: Snapshot) {
         const now = yield* Clock.currentTimeMillis;
         const generatedAt = DateTime.formatIso(DateTime.makeUnsafe(now));
         const base = {
@@ -206,8 +221,29 @@ export class DigestJob extends Context.Service<
             stories,
           };
         }
+        return digest;
+      });
+
+      const analyze = Effect.fn("DigestJob.analyze")(function* (date: string, snapshot: Snapshot) {
+        const digest = yield* buildDigest(date, snapshot);
         yield* store.saveDigest(date, digest);
         return digest;
+      });
+
+      const sendManually = Effect.fn("DigestJob.sendManually")(function* () {
+        const at = yield* Clock.currentTimeMillis;
+        const moment = localMoment(at, config.digestTimeZone);
+        // Its own conversation, so replies get this email's stories as context.
+        const thread = `${moment.date} manual ${String(moment.hour).padStart(2, "0")}:${String(moment.minute).padStart(2, "0")}`;
+
+        const snapshot = yield* collectSnapshot(false);
+        const digest = yield* buildDigest(moment.date, snapshot);
+        yield* store.saveDigest(thread, digest, { markSeen: false });
+        const messageId = yield* mailer.newMessageId;
+        yield* store.recordOutgoing(messageId, thread, "digest", at);
+        yield* mailer.send(renderDigestEmail(digest), "digest", { messageId });
+        yield* store.markSent(thread, messageId, yield* Clock.currentTimeMillis);
+        return { thread, stories: digest.stories.length };
       });
 
       const run = Effect.fn("DigestJob.run")(function* (date: string) {
@@ -285,7 +321,7 @@ export class DigestJob extends Context.Service<
           }
         });
 
-      return DigestJob.of({ run, now, runWithRetries });
+      return DigestJob.of({ run, now, runWithRetries, sendManually: sendManually() });
     }),
   );
 }

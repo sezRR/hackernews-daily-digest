@@ -55,8 +55,8 @@ status: ## Reply reader state, the cron entry, and the last digest log lines
 	@echo 'Last digest log lines ($(LOG)):'
 	@tail -n 8 '$(LOG)' 2>/dev/null || echo '  no log yet.'
 
-run: ## Send today's digest now, with retries, output to the terminal. Skips if already sent.
-	$(COMPOSE) run --rm digest
+run: ## Send a digest now, always. Doesn't count as today's: the scheduled one still goes out.
+	$(COMPOSE) run --rm digest node dist/run-digest.js --manual
 
 log-file: ## Create the digest log file, owned by you (asks for sudo the first time)
 	@if [ -w '$(LOG)' ]; then \

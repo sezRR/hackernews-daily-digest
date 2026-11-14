@@ -10,7 +10,11 @@ import { Store } from "./Store.js";
 // Sends today's digest now. Cron starts it at DIGEST_TIME in DIGEST_TIMEZONE (see
 // `make cron-set`) with --scheduled. After a failure it waits and tries again in the same
 // run, then emails the error if every attempt fails. Already sent today: it does nothing.
+//
+// With --manual (`make run`) it always sends a digest of the front page as it is now, and
+// leaves today's scheduled digest alone: nothing is marked sent or seen. Tried once.
 const scheduled = process.argv.includes("--scheduled");
+const manual = process.argv.includes("--manual");
 
 const pad = (value: number) => String(value).padStart(2, "0");
 
@@ -21,6 +25,19 @@ Effect.gen(function* () {
   const now = yield* job.now;
   const at = `${pad(now.hour)}:${pad(now.minute)} ${config.digestTimeZone}`;
   const expected = `${pad(config.digestTime.hour)}:${pad(config.digestTime.minute)}`;
+
+  if (manual) {
+    yield* Effect.logInfo(
+      `Manual digest: sending now (${at}). Today's ${expected} digest isn't affected and still goes out.`,
+    );
+    const before = yield* store.usage(now.date, "digest");
+    const result = yield* job.sendManually;
+    const after = yield* store.usage(now.date, "digest");
+    yield* Effect.logInfo(
+      `Manual digest: sent ${result.stories} stories (${after.inputTokens - before.inputTokens} input, ${after.outputTokens - before.outputTokens} output tokens). Replies to it are answered.`,
+    );
+    return;
+  }
 
   yield* Effect.logInfo(
     `Digest ${now.date}: starting at ${at}${scheduled ? " (cron)" : ""}. Up to ${MAX_ATTEMPTS} attempts, ${Duration.format(RETRY_DELAY)} apart.`,
