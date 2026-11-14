@@ -1,0 +1,35 @@
+# `make start` runs the reply reader. Cron runs the digest: `make cron-set` installs it.
+# `make` with no arguments lists every command.
+x-app: &app
+  build: .
+  image: hn-digest
+  env_file: .env
+  init: true
+  environment:
+    # Log timestamps in the same zone as the digest schedule. Read from .env by Compose.
+    TZ: ${DIGEST_TIMEZONE:-UTC}
+  volumes:
+    - data:/data
+
+services:
+  replies:
+    <<: *app
+    restart: unless-stopped
+    command: ["node", "dist/run-replies.js"]
+    # `make logs-replies` reads these. Rotated so they can't fill the disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  digest:
+    <<: *app
+    # Not started by `up`. Cron runs it with `docker compose run --rm -T digest`, and its
+    # output goes to logs/digest.log on the host.
+    profiles: ["cron"]
+    command: ["node", "dist/run-digest.js"]
+
+volumes:
+  # Holds the SQLite database: every digest, conversation and the mailbox position.
+  data:
