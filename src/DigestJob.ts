@@ -238,7 +238,8 @@ export class DigestJob extends Context.Service<
 
         const snapshot = yield* collectSnapshot(false);
         const digest = yield* buildDigest(moment.date, snapshot);
-        yield* store.saveDigest(thread, digest, { markSeen: false });
+        // Not marked as seen: the scheduled digest can still include these stories.
+        yield* store.saveDigest(thread, digest);
         const messageId = yield* mailer.newMessageId;
         yield* store.recordOutgoing(messageId, thread, "digest", at);
         yield* mailer.send(renderDigestEmail(digest), "digest", { messageId });
@@ -262,6 +263,7 @@ export class DigestJob extends Context.Service<
         }
         yield* mailer.send(renderDigestEmail(digest), "digest", { messageId });
         yield* store.markSent(date, messageId, yield* Clock.currentTimeMillis);
+        yield* store.markSeen(date, digest.stories.map((story) => story.id));
         return "sent" as const;
       });
 

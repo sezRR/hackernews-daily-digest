@@ -52,8 +52,11 @@ export class SmtpTransport extends Context.Service<
     Effect.map(AppConfig, (config) => {
       const transport = nodemailer.createTransport({
         host: "smtp.gmail.com",
-        port: 465,
-        secure: true,
+        // 587 with STARTTLS rather than 465: some hosts, Hetzner Cloud among them, block
+        // outgoing 465 and 25 by default. requireTLS refuses to continue unencrypted.
+        port: 587,
+        secure: false,
+        requireTLS: true,
         auth: { user: config.gmailUser, pass: Redacted.value(config.gmailAppPassword) },
         connectionTimeout: SMTP_TIMEOUT_MS,
         greetingTimeout: SMTP_TIMEOUT_MS,

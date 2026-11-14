@@ -148,11 +148,12 @@ export class Store extends Context.Service<
   {
     getDigestRow(date: string): Effect.Effect<DigestRow | null>;
     saveSnapshot(date: string, snapshot: Snapshot): Effect.Effect<void>;
+    saveDigest(date: string, digest: Digest): Effect.Effect<void>;
     /**
-     * Saves the finished digest and, unless `markSeen` is false, marks its stories as seen,
-     * atomically. A manual send passes false so the scheduled digest can still include them.
+     * Marks stories as sent, so later digests skip them. Called only after the email went
+     * out: a digest that never arrives mustn't hide its stories from the next one.
      */
-    saveDigest(date: string, digest: Digest, options?: { readonly markSeen?: boolean }): Effect.Effect<void>;
+    markSeen(date: string, storyIds: ReadonlyArray<number>): Effect.Effect<void>;
     /** `messageId` goes in the old `email_id` column, which held Resend's id before. */
     markSent(date: string, messageId: string, at: number): Effect.Effect<void>;
     recordFailure(date: string, at: number, error: string): Effect.Effect<number>;
@@ -228,19 +229,22 @@ export class Store extends Context.Service<
             yield* sql`UPDATE digests SET snapshot = ${encoded} WHERE date = ${date}`;
           }).pipe(Effect.orDie),
 
-        saveDigest: (date, digest, options) =>
+        saveDigest: (date, digest) =>
           Effect.gen(function* () {
             const encoded = yield* encodeDigest(digest);
             yield* upsertRow(date);
             yield* sql`UPDATE digests SET digest = ${encoded}, status = 'ready' WHERE date = ${date}`;
-            if (options?.markSeen === false) return;
-            for (const story of digest.stories) {
-              yield* sql`
-                INSERT INTO digest_stories (story_id, digest_date) VALUES (${story.id}, ${date})
-                ON CONFLICT (story_id) DO NOTHING
-              `;
-            }
           }).pipe(sql.withTransaction, Effect.orDie),
+
+        markSeen: (date, storyIds) =>
+          Effect.forEach(
+            storyIds,
+            (id) => sql`
+              INSERT INTO digest_stories (story_id, digest_date) VALUES (${id}, ${date})
+              ON CONFLICT (story_id) DO NOTHING
+            `,
+            { discard: true },
+          ).pipe(sql.withTransaction, Effect.orDie),
 
         markSent: (date, messageId, at) =>
           sql`UPDATE digests SET status = 'sent', email_id = ${messageId}, sent_at = ${at}, last_error = NULL

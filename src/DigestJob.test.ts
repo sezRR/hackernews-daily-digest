@@ -336,7 +336,7 @@ describe("run", () => {
     }).pipe(Effect.provide(failing.layer));
   });
 
-  it.effect("a story isn't marked as seen until its digest is saved", () => {
+  it.effect("a story isn't marked as seen when its digest fails before sending", () => {
     const failing = harness({ generate: new Error("model unavailable") });
     return Effect.gen(function* () {
       yield* TestClock.setTime(NOV_5_09_00);
@@ -390,6 +390,35 @@ describe("run", () => {
       assert.include(prompt, "A real comment");
       assert.notInclude(prompt, "someone");
       assert.notInclude(prompt, "example.com/1");
+    }).pipe(Effect.provide(h.layer));
+  });
+});
+
+describe("seen stories", () => {
+  it.effect("a digest that never sends leaves its stories for the next day", () => {
+    const h = harness({ mailFailures: ["timeout", "timeout"] });
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(NOV_5_09_00);
+      const job = yield* DigestJob;
+      const store = yield* Store;
+
+      yield* job.run("2026-11-05").pipe(Effect.flip);
+
+      assert.isNotNull((yield* store.getDigestRow("2026-11-05"))?.digest);
+      assert.strictEqual((yield* store.seenStoryIds([1])).size, 0);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("stories are marked as seen once the digest is sent", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(NOV_5_09_00);
+      const job = yield* DigestJob;
+      const store = yield* Store;
+
+      yield* job.run("2026-11-05");
+
+      assert.strictEqual((yield* store.seenStoryIds([1])).size, 1);
     }).pipe(Effect.provide(h.layer));
   });
 });
