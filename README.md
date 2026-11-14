@@ -30,13 +30,18 @@ nano .env
 make deploy
 
 # 3. Send today's digest now, to check the keys.
-make send-now
+make run
 
-# 4. Schedule the digest.
+# 4. Schedule the digest. Asks for sudo once, to create /var/log/hn-digest.log.
 make cron-set
 ```
 
-Cron runs the digest check every 30 minutes (`CRON_SCHEDULE`). It sends once the local time in `DIGEST_TIMEZONE` reaches `DIGEST_TIME`, so with `07:30` and `Europe/Lisbon` it arrives at 07:30 Lisbon time all year, whatever time zone the server uses. The other runs that day only log a line.
+Cron starts the digest once a day at `DIGEST_TIME` in `DIGEST_TIMEZONE`, so with `07:30` and `Europe/Lisbon` it runs at 07:30 Lisbon time all year. The email arrives a minute or so later, after the model call. `make cron-set` builds the entry from those two settings:
+
+- If the server's own time zone matches, the entry is a plain `30 7 * * *`.
+- If it doesn't, the entry starts with `CRON_TZ=Europe/Lisbon`, which tells cron which zone to use. Only some versions of cron support this (cronie does), and `make cron-set` checks yours first. Debian and Ubuntu's default cron ignores it, which would make the digest an hour late in summer. On those systems `make cron-set` installs nothing and tells you to run `sudo timedatectl set-timezone Europe/Lisbon` first.
+
+Every run also checks the clock. If cron ever starts it more than 5 minutes from `DIGEST_TIME`, the log gets a warning saying so.
 
 Plain `make` lists every command:
 
@@ -45,9 +50,9 @@ Plain `make` lists every command:
 | `make deploy` | Pull (if it's a git checkout), rebuild, restart the reply reader |
 | `make start` / `stop` / `restart` | Control the reply reader. Restart after editing `.env`. |
 | `make status` | Reply reader state, the cron entry, and the last digest runs |
-| `make run` | One cron run now, printing to the terminal. Sends only if due. |
-| `make send-now` | Send today's digest now, whatever the time |
-| `make cron-set` / `cron-list` / `cron-remove` | Manage the crontab entry |
+| `make run` | Send today's digest now, with retries, printing to the terminal. Skips if already sent today. |
+| `make cron-set` / `cron-list` / `cron-remove` | Manage the crontab entry. Other entries in your crontab are left alone. |
+| `make log-file` | Create `/var/log/hn-digest.log`, owned by you. `cron-set` runs it for you. |
 | `make logs` | Recent lines from both logs |
 | `make logs-digest` / `logs-replies` | Follow one log live |
 | `make errors` | Only warnings and errors, from both logs |
@@ -65,14 +70,14 @@ make start
 Every line has the date, time and offset in `DIGEST_TIMEZONE`, a level and the process name:
 
 ```
-2026-11-14 07:30:01 +00:00 INFO  [digest] Digest 2026-11-14: sent (21043 input, 1588 output tokens)
-2026-11-14 08:00:01 +00:00 INFO  [digest] Digest 2026-11-14: already sent or given up today, nothing to do
+2026-11-14 07:30:01 +00:00 INFO  [digest] Digest 2026-11-14: starting at 07:30 Europe/Lisbon (cron). Up to 4 attempts, 30m apart.
+2026-11-14 07:31:05 +00:00 INFO  [digest] Digest 2026-11-14: sent (21043 input, 1588 output tokens)
 2026-11-14 09:12:16 +00:00 INFO  [replies] Answering a question about the 2026-11-14 digest
 2026-11-14 09:12:40 +00:00 INFO  [replies] Sent a reply in the 2026-11-14 digest thread
 2026-11-14 09:12:40 +00:00 INFO  [replies] Checked: 3 new emails, answered 1 reply
 ```
 
-- **Digest:** cron appends to `logs/digest.log` in the project folder, one line per run. A gap of more than 30 minutes means cron isn't running. The file grows by about 5 KB a day.
+- **Digest:** cron appends to `/var/log/hn-digest.log`, a few lines a day, so it stays tiny. Cron runs as you, not root, so `make cron-set` creates the file once with sudo and makes you its owner. A day with no lines means cron didn't run. Put it elsewhere with `make cron-set LOG=/path/to/file`, and pass the same `LOG=` to the log commands.
 - **Replies:** one line when the first check succeeds, one for every check that found new mail (`Checked: 2 new emails, no replies to answer`), and an hourly summary, so a quiet log still shows it's alive. Lines hold counts only, never senders or subjects. Docker keeps this log, rotated at 5 files of 10 MB.
 - **Errors:** failures log at `WARN` or `ERROR` with the full cause, so `make errors` finds them. A wrong app password or API key shows up there first.
 
@@ -104,9 +109,9 @@ Test emails start with `[test]` and use a separate database, `data/dev.db`, whic
 
 **Replies.** The reader checks the mailbox every `REPLY_POLL_SECONDS`. It reads Gmail's All Mail folder read-only, so it never marks anything as read, and it starts from the newest mail the first time it runs. Write your question above the quoted email: text below the quote is ignored. Each digest day is one conversation, so a follow-up remembers what you asked earlier about that day's stories. A digest with nothing new today still accepts questions. The model can use read-only Hacker News tools for up to 5 rounds per question.
 
-**Failures.** Each stage of the digest is saved, so a retry continues where the last attempt stopped: a failed send doesn't pay for another model call. Cron retries every 30 minutes, up to 4 attempts. Then it emails you the error and tries again the next day. A retry reuses the same Message-ID, so if an earlier attempt did go out, Gmail usually drops the second copy.
+**Failures.** Each stage of the digest is saved, so a retry continues where the last attempt stopped: a failed send doesn't pay for another model call. After a failure, the same run waits 30 minutes and tries again, up to 4 attempts. Then it emails you the error and stops until tomorrow. A retry reuses the same Message-ID, so if an earlier attempt did go out, Gmail usually drops the second copy.
 
-**Missed runs.** If the server was down at `DIGEST_TIME`, the next cron run that day sends the digest. Earlier missed days are skipped.
+**Missed runs.** If the server is down at `DIGEST_TIME`, that day's digest is skipped. Run `make run` to send it late.
 
 **Cost.** Once `CHAT_DAILY_TOKEN_LIMIT` is reached, replies get a short "budget used up" answer until midnight UTC. Digests don't count toward the limit.
 

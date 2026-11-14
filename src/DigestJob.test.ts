@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest";
-import { Effect, Layer } from "effect";
+import { Effect, Fiber, Layer } from "effect";
 import { TestClock } from "effect/testing";
 import { Analyst, stripUrls } from "./Analyst.js";
 import type { Story } from "./domain.js";
@@ -7,8 +7,9 @@ import {
   buildDigestStories,
   buildImportant,
   DigestJob,
-  isDue,
+  isOnTime,
   localMoment,
+  minutesFrom,
   selectStories,
 } from "./DigestJob.js";
 import { Store } from "./Store.js";
@@ -21,10 +22,8 @@ import {
 } from "./test-helpers.js";
 
 const NOV_5_09_00 = Date.UTC(2026, 10, 5, 9, 0);
-const NOV_5_07_00 = Date.UTC(2026, 10, 5, 7, 0);
 const NOV_6_09_00 = Date.UTC(2026, 10, 6, 9, 0);
 const THIRTY_MINUTES = 30 * 60 * 1000;
-const RETRY_GAP = 25 * 60 * 1000;
 
 describe("schedule", () => {
   it("uses the configured time zone for both date and time", () => {
@@ -37,13 +36,30 @@ describe("schedule", () => {
     assert.strictEqual(localMoment(Date.UTC(2026, 10, 5, 0, 5), "UTC").hour, 0);
   });
 
-  it("is due from the configured minute onward", () => {
-    const time = { hour: 8, minute: 30 };
+  it("measures how far a start time is from DIGEST_TIME, the short way round midnight", () => {
+    const time = { hour: 7, minute: 30 };
+    const at = (hour: number, minute: number) => ({ date: "d", hour, minute });
 
-    assert.isFalse(isDue({ date: "d", hour: 8, minute: 29 }, time));
-    assert.isTrue(isDue({ date: "d", hour: 8, minute: 30 }, time));
-    assert.isTrue(isDue({ date: "d", hour: 23, minute: 0 }, time));
-    assert.isFalse(isDue({ date: "d", hour: 7, minute: 59 }, time));
+    assert.strictEqual(minutesFrom(at(7, 30), time), 0);
+    assert.strictEqual(minutesFrom(at(8, 30), time), 60);
+    assert.strictEqual(minutesFrom(at(6, 30), time), -60);
+    assert.strictEqual(minutesFrom(at(23, 30), { hour: 0, minute: 10 }), -40);
+  });
+
+  it("counts a start within five minutes as on time", () => {
+    const time = { hour: 7, minute: 30 };
+
+    assert.isTrue(isOnTime({ date: "d", hour: 7, minute: 30 }, time));
+    assert.isTrue(isOnTime({ date: "d", hour: 7, minute: 35 }, time));
+    assert.isFalse(isOnTime({ date: "d", hour: 8, minute: 30 }, time));
+    assert.isFalse(isOnTime({ date: "d", hour: 6, minute: 30 }, time));
+  });
+
+  it("an hour's gap is what a cron ignoring CRON_TZ produces in Lisbon's summer", () => {
+    // Server on UTC, cron fires 07:30 UTC, which is 08:30 in Lisbon in July.
+    const moment = localMoment(Date.UTC(2026, 6, 1, 7, 30), "Europe/Lisbon");
+
+    assert.isFalse(isOnTime(moment, { hour: 7, minute: 30 }));
   });
 });
 
@@ -378,93 +394,96 @@ describe("run", () => {
   });
 });
 
-describe("tick", () => {
-  it.effect("does nothing before the digest time", () => {
-    const h = harness();
-    return Effect.gen(function* () {
-      yield* TestClock.setTime(NOV_5_07_00);
-      const job = yield* DigestJob;
-
-      assert.strictEqual(yield* job.tick, "not-due");
-
-      assert.strictEqual(h.mail.sent.length, 0);
-      assert.strictEqual(h.net.calls.length, 0);
-    }).pipe(Effect.provide(h.layer));
+/**
+ * Lets a forked run get as far as its retry sleep: TestClock.adjust only fires sleeps that
+ * have already started. Waits for the given number of failed attempts, then a little more.
+ */
+const untilAttempts = (date: string, attempts: number) =>
+  Effect.gen(function* () {
+    const store = yield* Store;
+    for (let i = 0; i < 10_000; i++) {
+      if (((yield* store.getDigestRow(date))?.attempts ?? 0) >= attempts) break;
+      yield* Effect.yieldNow;
+    }
+    for (let i = 0; i < 100; i++) yield* Effect.yieldNow;
   });
 
-  it.effect("catches up when started after the digest time, then stays quiet", () => {
+describe("runWithRetries", () => {
+  it.effect("sends on the first attempt", () => {
     const h = harness();
     return Effect.gen(function* () {
       yield* TestClock.setTime(NOV_5_09_00);
       const job = yield* DigestJob;
 
-      assert.strictEqual(yield* job.tick, "sent");
-      assert.strictEqual(yield* job.tick, "done");
-
+      assert.strictEqual(yield* job.runWithRetries("2026-11-05"), "sent");
       assert.strictEqual(h.mail.sent.length, 1);
     }).pipe(Effect.provide(h.layer));
   });
 
-  it.effect("waits between attempts after a failure", () => {
+  it.effect("does nothing when today's digest was already sent", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(NOV_5_09_00);
+      const job = yield* DigestJob;
+
+      yield* job.runWithRetries("2026-11-05");
+      assert.strictEqual(yield* job.runWithRetries("2026-11-05"), "already-sent");
+      assert.strictEqual(h.mail.sent.length, 1);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("after a failure, waits 30 minutes in the same run and tries again", () => {
     const h = harness({ mailFailures: ["down"] });
     return Effect.gen(function* () {
       yield* TestClock.setTime(NOV_5_09_00);
       const job = yield* DigestJob;
       const store = yield* Store;
 
-      assert.strictEqual(yield* job.tick, "retry-later");
-      assert.strictEqual((yield* store.getDigestRow("2026-11-05"))?.attempts, 1);
-
-      yield* TestClock.adjust(RETRY_GAP - 1000);
-      assert.strictEqual(yield* job.tick, "waiting-to-retry");
-      assert.strictEqual((yield* store.getDigestRow("2026-11-05"))?.attempts, 1);
+      const fiber = yield* Effect.forkChild(job.runWithRetries("2026-11-05"));
+      yield* untilAttempts("2026-11-05", 1);
+      yield* TestClock.adjust(THIRTY_MINUTES - 1000);
       assert.strictEqual(h.mail.sent.length, 0);
+      assert.strictEqual((yield* store.getDigestRow("2026-11-05"))?.attempts, 1);
 
       yield* TestClock.adjust(1000);
-      assert.strictEqual(yield* job.tick, "sent");
+      assert.strictEqual(yield* Fiber.join(fiber), "sent");
       assert.strictEqual(h.mail.sent.length, 1);
-      assert.strictEqual((yield* store.getDigestRow("2026-11-05"))?.status, "sent");
+      // The retry reused the saved digest instead of calling the model again.
+      assert.strictEqual(h.model.requests.length, 1);
     }).pipe(Effect.provide(h.layer));
   });
 
-  it.effect("gives up after four attempts, alerts once, and tries again tomorrow", () => {
+  it.effect("gives up after four attempts, alerts once, and runs normally the next day", () => {
     const h = harness({ generate: new Error("model unavailable") });
     return Effect.gen(function* () {
       yield* TestClock.setTime(NOV_5_09_00);
       const job = yield* DigestJob;
       const store = yield* Store;
 
-      for (let attempt = 0; attempt < 6; attempt++) {
-        yield* job.tick;
+      const fiber = yield* Effect.forkChild(job.runWithRetries("2026-11-05"));
+      for (let attempt = 1; attempt < 4; attempt++) {
+        yield* untilAttempts("2026-11-05", attempt);
         yield* TestClock.adjust(THIRTY_MINUTES);
       }
+      assert.strictEqual(yield* Fiber.join(fiber), "gave-up");
 
       assert.strictEqual(h.model.requests.length, 4);
       assert.strictEqual((yield* store.getDigestRow("2026-11-05"))?.status, "failed");
       assert.strictEqual(h.mail.sent.length, 1);
-      assert.include(h.mail.sent[0]?.email.subject ?? "", "failed");
-      assert.include(h.mail.sent[0]?.email.text ?? "", "model unavailable");
       assert.strictEqual(h.mail.sent[0]?.kind, "alert");
+      assert.include(h.mail.sent[0]?.email.text ?? "", "model unavailable");
       // Alerts aren't threads to chat in, so replies to them are ignored.
       const alertId = h.mail.sent[0]?.threading.messageId ?? "";
       assert.strictEqual((yield* store.findOutgoing([alertId])).size, 0);
 
+      // Running again the same day doesn't retry or alert twice.
+      assert.strictEqual(yield* job.runWithRetries("2026-11-05"), "gave-up");
+      assert.strictEqual(h.mail.sent.length, 1);
+
       yield* TestClock.setTime(NOV_6_09_00);
-      yield* job.tick;
+      yield* Effect.forkChild(job.runWithRetries("2026-11-06"));
+      yield* untilAttempts("2026-11-06", 1);
       assert.strictEqual(h.model.requests.length, 5);
-    }).pipe(Effect.provide(h.layer));
-  });
-
-  it.effect("a tick that fails entirely still leaves the scheduler alive", () => {
-    const h = harness({ generate: new Error("model unavailable") });
-    return Effect.gen(function* () {
-      yield* TestClock.setTime(NOV_5_09_00);
-      const job = yield* DigestJob;
-
-      const exit = yield* Effect.exit(job.tick);
-
-      assert.strictEqual(exit._tag, "Success");
-      assert.deepStrictEqual(exit._tag === "Success" ? exit.value : null, "retry-later");
     }).pipe(Effect.provide(h.layer));
   });
 });

@@ -8,12 +8,11 @@ import { HackerNews } from "./HackerNews.js";
 import { type MailError, Mailer } from "./Mailer.js";
 import { Store } from "./Store.js";
 
-/**
- * Cron runs a tick every 30 minutes. The gap is a little shorter so that a failure partway
- * through one run doesn't push the retry back by a whole extra slot.
- */
-const RETRY_INTERVAL = Duration.toMillis(Duration.minutes(25));
-const MAX_ATTEMPTS = 4;
+/** After a failed attempt, the same run waits this long and tries again. */
+export const RETRY_DELAY = Duration.minutes(30);
+export const MAX_ATTEMPTS = 4;
+/** How far from DIGEST_TIME a cron start can be before it's logged as a warning. */
+const ON_TIME_TOLERANCE_MINUTES = 5;
 const MAX_IMPORTANT = 3;
 
 const FRONT_PAGE_PARAMS = { limit: 30, comments_per_story: 0, max_comment_chars: 500 };
@@ -45,8 +44,18 @@ export const localMoment = (nowMillis: number, timeZone: string): LocalMoment =>
   };
 };
 
-export const isDue = (moment: LocalMoment, time: DigestTime): boolean =>
-  moment.hour > time.hour || (moment.hour === time.hour && moment.minute >= time.minute);
+/**
+ * Minutes between a local time and DIGEST_TIME, the short way round midnight. Cron should
+ * start the digest at DIGEST_TIME; a big gap means cron is reading the time in another zone.
+ */
+export const minutesFrom = (moment: LocalMoment, time: DigestTime): number => {
+  const difference = moment.hour * 60 + moment.minute - (time.hour * 60 + time.minute);
+  const wrapped = ((difference % 1440) + 1440) % 1440;
+  return wrapped > 720 ? wrapped - 1440 : wrapped;
+};
+
+export const isOnTime = (moment: LocalMoment, time: DigestTime): boolean =>
+  Math.abs(minutesFrom(moment, time)) <= ON_TIME_TOLERANCE_MINUTES;
 
 export interface SelectionRules {
   readonly maxStories: number;
@@ -108,25 +117,21 @@ export const buildImportant = (
     .map((entry) => ({ story_id: entry.story_id, why: stripUrls(entry.why) }));
 };
 
-export type TickOutcome =
-  | "not-due"
-  | "done"
-  | "waiting-to-retry"
-  | "sent"
-  | "already-sent"
-  | "gave-up"
-  | "retry-later"
-  | "crashed";
+export type RunOutcome = "sent" | "already-sent" | "gave-up";
 
 export class DigestJob extends Context.Service<
   DigestJob,
   {
     /** Generates and sends the given day's digest, resuming whatever an earlier attempt finished. */
-    run(date: string): Effect.Effect<"sent" | "already-sent" | "gave-up", RunError>;
-    /** Today's date in the configured time zone. */
-    readonly today: Effect.Effect<string>;
-    /** One scheduler step: runs today's digest if it's due and not done. Never fails. */
-    readonly tick: Effect.Effect<TickOutcome>;
+    run(date: string): Effect.Effect<RunOutcome, RunError>;
+    /** Today's date and time in the configured time zone. */
+    readonly now: Effect.Effect<LocalMoment>;
+    /**
+     * What cron runs at DIGEST_TIME: sends the day's digest, and after a failure waits
+     * RETRY_DELAY and tries again, up to MAX_ATTEMPTS in all. Then it emails the error and
+     * stops for the day. Never fails: every problem is logged.
+     */
+    runWithRetries(date: string): Effect.Effect<RunOutcome>;
   }
 >()("hackernews-mcp/DigestJob") {
   static readonly layer = Layer.effect(
@@ -224,8 +229,8 @@ export class DigestJob extends Context.Service<
         return "sent" as const;
       });
 
-      const today = Effect.map(Clock.currentTimeMillis, (now) =>
-        localMoment(now, config.digestTimeZone).date,
+      const now = Effect.map(Clock.currentTimeMillis, (millis) =>
+        localMoment(millis, config.digestTimeZone),
       );
 
       const handleFailure = Effect.fn("DigestJob.handleFailure")(function* (
@@ -233,10 +238,15 @@ export class DigestJob extends Context.Service<
         error: RunError,
       ) {
         yield* Effect.logError(`Digest ${date} failed: ${error.message}`);
-        const now = yield* Clock.currentTimeMillis;
-        const attempts = yield* store.recordFailure(date, now, error.message);
-        if (attempts < MAX_ATTEMPTS) return;
+        const attempts = yield* store.recordFailure(date, yield* Clock.currentTimeMillis, error.message);
+        if (attempts < MAX_ATTEMPTS) {
+          yield* Effect.logWarning(
+            `Attempt ${attempts} of ${MAX_ATTEMPTS} failed. Trying again in ${Duration.format(RETRY_DELAY)}.`,
+          );
+          return "retry" as const;
+        }
 
+        yield* Effect.logError(`Giving up for today after ${attempts} attempts. Emailing the error.`);
         yield* store.markFailed(date);
         yield* mailer
           .send(renderFailureEmail(date, attempts, error.message), "alert", {
@@ -247,32 +257,35 @@ export class DigestJob extends Context.Service<
               Effect.logError(`Could not send failure alert: ${mailError.message}`),
             ),
           );
+        return "gave-up" as const;
       });
 
-      const tick = Effect.gen(function* () {
-        const now = yield* Clock.currentTimeMillis;
-        const moment = localMoment(now, config.digestTimeZone);
-        if (!isDue(moment, config.digestTime)) return "not-due" as const;
+      const runWithRetries = (date: string): Effect.Effect<RunOutcome> =>
+        Effect.gen(function* () {
+          while (true) {
+            const result = yield* run(date).pipe(
+              Effect.map((outcome) => ({ outcome })),
+              Effect.catch((error) => Effect.map(handleFailure(date, error), (next) => ({ next }))),
+              // A defect counts as a failed attempt too, so it still retries and alerts.
+              Effect.catchDefect((defect) =>
+                Effect.logError("Digest attempt crashed", defect).pipe(
+                  Effect.andThen(
+                    handleFailure(
+                      date,
+                      new AnalysisError({ reason: `crashed: ${String(defect)}` }),
+                    ),
+                  ),
+                  Effect.map((next) => ({ next })),
+                ),
+              ),
+            );
+            if ("outcome" in result) return result.outcome;
+            if (result.next === "gave-up") return "gave-up" as const;
+            yield* Effect.sleep(RETRY_DELAY);
+          }
+        });
 
-        const row = yield* store.getDigestRow(moment.date);
-        if (row?.status === "sent" || row?.status === "failed") return "done" as const;
-        if (row?.lastAttemptAt != null && now - row.lastAttemptAt < RETRY_INTERVAL) {
-          return "waiting-to-retry" as const;
-        }
-
-        return yield* run(moment.date).pipe(
-          Effect.catch((error) =>
-            handleFailure(moment.date, error).pipe(Effect.as("retry-later" as const)),
-          ),
-        );
-      }).pipe(
-        // A defect must not stop the next run, or tomorrow's digest.
-        Effect.catchCause((cause) =>
-          Effect.logError("Digest tick crashed", cause).pipe(Effect.as("crashed" as const)),
-        ),
-      );
-
-      return DigestJob.of({ run, today, tick });
+      return DigestJob.of({ run, now, runWithRetries });
     }),
   );
 }

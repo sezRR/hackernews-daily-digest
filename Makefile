@@ -1,30 +1,32 @@
 # Run these on the VPS, from the project folder. Plain `make` lists the commands.
 #
-# The cron schedule comes from CRON_SCHEDULE in .env (every 30 minutes if unset). A value on
-# the command line wins:  make cron-set SCHEDULE='*/15 * * * *'
-# Keep it at least every 30 minutes: each run checks whether the digest is due and retries
-# failures, so a sparser schedule sends late.
+# Cron sends the digest once a day at DIGEST_TIME in DIGEST_TIMEZONE, both read from .env.
+# Run `make cron-set` again after changing either.
 
 # Only these keys are read out of .env. Including the whole file would make `make` interpret
 # any "$" or "#" in the secrets. Surrounding quotes are dropped.
 env = $(shell sed -n 's/^$(1)=//p' .env 2>/dev/null | tail -1 | tr -d "\"'")
 
-SCHEDULE ?= $(or $(call env,CRON_SCHEDULE),*/30 * * * *)
-LOG      ?= $(CURDIR)/logs/digest.log
-LINES    ?= 50
+TIME  := $(or $(call env,DIGEST_TIME),07:30)
+ZONE  := $(or $(call env,DIGEST_TIMEZONE),UTC)
+LINES ?= 50
 
-# Cron's PATH is minimal, so the line uses docker's full path.
+# Where cron writes the digest log. Cron runs as you, not root, so `make log-file` creates it
+# once with sudo and gives it to you. Override with LOG=... on the command line.
+LOG ?= /var/log/hn-digest.log
+ME  := $(shell id -un)
+
+# Cron's PATH is minimal, so the entry uses docker's full path.
 DOCKER  := $(or $(shell command -v docker 2>/dev/null),/usr/bin/docker)
 COMPOSE := $(DOCKER) compose
 
-# Marks our line in the crontab so cron-set can replace it instead of adding a duplicate.
+# Marks our entry in the crontab so cron-set can replace it instead of adding a duplicate.
 TAG := hn-digest-cron
 
-# The trailing "# TAG" is a shell comment: cron hands the whole command to sh.
-# --progress quiet keeps Compose's "Container ... Creating" lines out of the log.
-CRON_LINE = $(SCHEDULE) cd $(CURDIR) && $(COMPOSE) --progress quiet run --rm -T digest >> $(LOG) 2>&1 \# $(TAG)
+CRON = TAG='$(TAG)' TIME='$(TIME)' ZONE='$(ZONE)' LOG='$(LOG)' DIR='$(CURDIR)' DOCKER='$(DOCKER)' \
+	sh scripts/cron.sh
 
-.PHONY: help deploy start stop restart status run send-now cron-set cron-list cron-remove \
+.PHONY: help deploy start stop restart status run log-file cron-set cron-list cron-remove \
 	logs logs-digest logs-replies errors
 
 # First target, so it is what a bare `make` runs. It prints every target that has a "## text".
@@ -39,39 +41,44 @@ deploy: ## Pull the latest code (if this is a git checkout), rebuild, restart th
 start: ## Start the reply reader in the background
 	$(COMPOSE) up -d replies
 
-stop: ## Stop the reply reader. The cron digest keeps running.
+stop: ## Stop the reply reader. The daily digest still runs from cron.
 	$(COMPOSE) stop replies
 
 restart: ## Restart the reply reader, e.g. after editing .env
 	$(COMPOSE) up -d --force-recreate replies
 
-status: ## Reply reader state, the cron entry, and the last digest runs
+status: ## Reply reader state, the cron entry, and the last digest log lines
 	@$(COMPOSE) ps replies
 	@echo
-	@echo 'Cron entry:'
-	@crontab -l 2>/dev/null | grep -F '$(TAG)' || echo '  none. Run make cron-set.'
+	@$(CRON) list
 	@echo
-	@echo 'Last digest runs ($(LOG)):'
-	@tail -n 5 '$(LOG)' 2>/dev/null || echo '  no log yet.'
+	@echo 'Last digest log lines ($(LOG)):'
+	@tail -n 8 '$(LOG)' 2>/dev/null || echo '  no log yet.'
 
-run: ## One cron run now: sends only if due and not sent yet. Output to the terminal.
+run: ## Send today's digest now, with retries, output to the terminal. Skips if already sent.
 	$(COMPOSE) run --rm digest
 
-send-now: ## Send today's digest now, whatever the time. Does nothing if already sent today.
-	$(COMPOSE) run --rm digest node dist/run-digest.js --now
+log-file: ## Create the digest log file, owned by you (asks for sudo the first time)
+	@if [ -w '$(LOG)' ]; then \
+		echo 'Log file ready: $(LOG)'; \
+	elif [ -e '$(LOG)' ]; then \
+		echo '$(LOG) exists but you cannot write to it. Giving it to $(ME) with sudo:'; \
+		sudo chown '$(ME)':"$$(id -gn)" '$(LOG)'; \
+	elif touch '$(LOG)' 2>/dev/null; then \
+		echo 'Created $(LOG)'; \
+	else \
+		echo 'Creating $(LOG) with sudo, owned by $(ME):'; \
+		sudo install -m 644 -o '$(ME)' -g "$$(id -gn)" /dev/null '$(LOG)'; \
+	fi
 
-cron-set: ## Install (or replace) the crontab entry that runs the digest
-	@mkdir -p '$(dir $(LOG))'
-	@( crontab -l 2>/dev/null | grep -vF '$(TAG)'; echo '$(CRON_LINE)' ) | crontab -
-	@echo 'Installed:'
-	@crontab -l | grep -F '$(TAG)'
+cron-set: log-file ## Install (or replace) the daily crontab entry for DIGEST_TIME
+	@$(CRON) set
 
-cron-list: ## Show the current user's crontab
-	@crontab -l 2>/dev/null || echo 'No crontab for $(shell whoami).'
+cron-list: ## Show this project's crontab entry
+	@$(CRON) list
 
-cron-remove: ## Remove the crontab entry
-	@( crontab -l 2>/dev/null | grep -vF '$(TAG)' ) | crontab -
-	@echo 'Removed the $(TAG) entry.'
+cron-remove: ## Remove this project's crontab entry
+	@$(CRON) remove
 
 logs: ## Recent lines from both the digest and the reply reader
 	@echo '== digest ($(LOG))'
@@ -80,8 +87,7 @@ logs: ## Recent lines from both the digest and the reply reader
 	@echo '== replies'
 	@$(COMPOSE) logs --no-log-prefix --tail $(LINES) replies
 
-logs-digest: ## Follow the digest log as cron writes it (Ctrl-C to stop)
-	@mkdir -p '$(dir $(LOG))' && touch '$(LOG)'
+logs-digest: ## Follow the digest log (Ctrl-C to stop)
 	tail -n $(LINES) -F '$(LOG)'
 
 logs-replies: ## Follow the reply reader's log (Ctrl-C to stop)

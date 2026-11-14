@@ -25,8 +25,8 @@ services:
 
   digest:
     <<: *app
-    # Not started by `up`. Cron runs it with `docker compose run --rm -T digest`, and its
-    # output goes to logs/digest.log on the host.
+    # Not started by `up`. Cron runs it once a day at DIGEST_TIME (`make cron-set`), and its
+    # output goes to /var/log/hn-digest.log on the host.
     profiles: ["cron"]
     command: ["node", "dist/run-digest.js"]
 

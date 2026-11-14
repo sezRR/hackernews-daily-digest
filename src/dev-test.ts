@@ -46,7 +46,7 @@ const real = Effect.gen(function* () {
   const config = yield* AppConfig;
   const job = yield* DigestJob;
   const store = yield* Store;
-  const date = yield* job.today;
+  const date = (yield* job.now).date;
 
   yield* startDayOver(date);
   yield* Effect.logInfo(`Building today's digest (${date}) from the live front page. This calls ${config.model}.`);

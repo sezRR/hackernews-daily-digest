@@ -32,7 +32,7 @@ const messageText = (message: unknown): string =>
     .map((part) => (typeof part === "string" ? part : JSON.stringify(part)))
     .join(" ");
 
-/** One line per entry, greppable by level and job: `grep ERROR logs/digest.log`. */
+/** One line per entry, greppable by level and job: `grep ERROR /var/log/hn-digest.log`. */
 export const formatLine = (job: string, options: Logger.Options<unknown>): string => {
   const line = `${timestamp(options.date)} ${LEVELS[options.logLevel] ?? options.logLevel} [${job}] ${messageText(options.message)}`;
   return options.cause.reasons.length === 0 ? line : `${line}\n${Cause.pretty(options.cause)}`;
