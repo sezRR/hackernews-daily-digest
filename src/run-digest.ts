@@ -3,7 +3,14 @@ import { NodeRuntime } from "@effect/platform-node";
 import { Duration, Effect } from "effect";
 import { AppConfig } from "./AppConfig.js";
 import { digestServices } from "./AppLive.js";
-import { DigestJob, isOnTime, MAX_ATTEMPTS, minutesFrom, RETRY_DELAY } from "./DigestJob.js";
+import {
+  DigestJob,
+  isOnTime,
+  MAX_ATTEMPTS,
+  minutesFrom,
+  RETRY_DELAY,
+  RUN_CLAIM_EXPIRY,
+} from "./DigestJob.js";
 import { LoggerLive, logFailure } from "./logging.js";
 import { Store } from "./Store.js";
 
@@ -58,6 +65,12 @@ Effect.gen(function* () {
     );
   } else if (outcome === "already-sent") {
     yield* Effect.logInfo(`Digest ${now.date}: already sent today, nothing to do`);
+  } else if (outcome === "already-running") {
+    yield* Effect.logWarning(
+      `Digest ${now.date}: another run is already working on today's digest, so this one stops. ` +
+        "Two runs at once usually means two crontab entries: compare `crontab -l` with `sudo crontab -l`. " +
+        `If that run died, its claim lapses ${Duration.format(RUN_CLAIM_EXPIRY)} after it started.`,
+    );
   } else {
     yield* Effect.logError(`Digest ${now.date}: gave up after ${MAX_ATTEMPTS} attempts`);
   }

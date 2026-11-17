@@ -11,6 +11,12 @@ import { Store } from "./Store.js";
 /** After a failed attempt, the same run waits this long and tries again. */
 export const RETRY_DELAY = Duration.minutes(30);
 export const MAX_ATTEMPTS = 4;
+/**
+ * A run claims the day so a second process started at the same time exits instead of
+ * sending a second digest. If the run dies without letting go, the claim lapses after this
+ * long. A full run, four attempts 30 minutes apart, ends well within it.
+ */
+export const RUN_CLAIM_EXPIRY = Duration.hours(3);
 /** How far from DIGEST_TIME a cron start can be before it's logged as a warning. */
 const ON_TIME_TOLERANCE_MINUTES = 5;
 const MAX_IMPORTANT = 3;
@@ -117,7 +123,7 @@ export const buildImportant = (
     .map((entry) => ({ story_id: entry.story_id, why: stripUrls(entry.why) }));
 };
 
-export type RunOutcome = "sent" | "already-sent" | "gave-up";
+export type RunOutcome = "sent" | "already-sent" | "already-running" | "gave-up";
 
 export class DigestJob extends Context.Service<
   DigestJob,
@@ -129,7 +135,8 @@ export class DigestJob extends Context.Service<
     /**
      * What cron runs at DIGEST_TIME: sends the day's digest, and after a failure waits
      * RETRY_DELAY and tries again, up to MAX_ATTEMPTS in all. Then it emails the error and
-     * stops for the day. Never fails: every problem is logged.
+     * stops for the day. Never fails: every problem is logged. Returns "already-running",
+     * doing nothing, while another run is working on the same day.
      */
     runWithRetries(date: string): Effect.Effect<RunOutcome>;
     /**
@@ -299,6 +306,14 @@ export class DigestJob extends Context.Service<
       });
 
       const runWithRetries = (date: string): Effect.Effect<RunOutcome> =>
+        Effect.gen(function* () {
+          const startedAt = yield* Clock.currentTimeMillis;
+          const expiredBefore = startedAt - Duration.toMillis(RUN_CLAIM_EXPIRY);
+          if (!(yield* store.claimRun(date, startedAt, expiredBefore))) return "already-running" as const;
+          return yield* attemptUntilDone(date).pipe(Effect.ensuring(store.releaseRun(date, startedAt)));
+        });
+
+      const attemptUntilDone = (date: string): Effect.Effect<RunOutcome> =>
         Effect.gen(function* () {
           while (true) {
             const result = yield* run(date).pipe(

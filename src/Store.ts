@@ -135,6 +135,11 @@ const Migrations = SqliteMigrator.layer({
       const sql = yield* SqlClient.SqlClient;
       yield* sql`ALTER TABLE token_usage ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0`;
     }),
+    // When the run working on that day's digest started. NULL when no run holds it.
+    "0004_run_claim": Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`ALTER TABLE digests ADD COLUMN run_started_at INTEGER`;
+    }),
   }),
 });
 
@@ -147,6 +152,14 @@ export class Store extends Context.Service<
   Store,
   {
     getDigestRow(date: string): Effect.Effect<DigestRow | null>;
+    /**
+     * Makes this run the only one working on the day's digest, so two processes started at
+     * once can't both send it. False if another run holds it. A claim taken at or before
+     * `expiredBefore` counts as abandoned (its process died) and is taken over.
+     */
+    claimRun(date: string, at: number, expiredBefore: number): Effect.Effect<boolean>;
+    /** Lets go of the claim taken at `at`. A claim another run took over is left alone. */
+    releaseRun(date: string, at: number): Effect.Effect<void>;
     saveSnapshot(date: string, snapshot: Snapshot): Effect.Effect<void>;
     saveDigest(date: string, digest: Digest): Effect.Effect<void>;
     /**
@@ -221,6 +234,24 @@ export class Store extends Context.Service<
               lastError: row.last_error,
             } satisfies DigestRow;
           }).pipe(Effect.orDie),
+
+        // One UPDATE, so SQLite's write lock decides between two processes: only one matches.
+        claimRun: (date, at, expiredBefore) =>
+          Effect.gen(function* () {
+            yield* upsertRow(date);
+            const rows = yield* sql<{ date: string }>`
+              UPDATE digests SET run_started_at = ${at}
+              WHERE date = ${date} AND (run_started_at IS NULL OR run_started_at <= ${expiredBefore})
+              RETURNING date
+            `;
+            return rows.length > 0;
+          }).pipe(Effect.orDie),
+
+        releaseRun: (date, at) =>
+          sql`UPDATE digests SET run_started_at = NULL WHERE date = ${date} AND run_started_at = ${at}`.pipe(
+            Effect.asVoid,
+            Effect.orDie,
+          ),
 
         saveSnapshot: (date, snapshot) =>
           Effect.gen(function* () {

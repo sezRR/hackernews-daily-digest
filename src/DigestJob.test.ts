@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest";
-import { Effect, Fiber, Layer } from "effect";
+import { Duration, Effect, Fiber, Layer } from "effect";
 import { TestClock } from "effect/testing";
 import { Analyst, stripUrls } from "./Analyst.js";
 import type { Story } from "./domain.js";
@@ -10,6 +10,7 @@ import {
   isOnTime,
   localMoment,
   minutesFrom,
+  RUN_CLAIM_EXPIRY,
   selectStories,
 } from "./DigestJob.js";
 import { Store } from "./Store.js";
@@ -24,6 +25,7 @@ import {
 const NOV_5_09_00 = Date.UTC(2026, 10, 5, 9, 0);
 const NOV_6_09_00 = Date.UTC(2026, 10, 6, 9, 0);
 const THIRTY_MINUTES = 30 * 60 * 1000;
+const RUN_CLAIM_EXPIRY_MILLIS = Duration.toMillis(RUN_CLAIM_EXPIRY);
 
 describe("schedule", () => {
   it("uses the configured time zone for both date and time", () => {
@@ -457,6 +459,52 @@ describe("runWithRetries", () => {
 
       yield* job.runWithRetries("2026-11-05");
       assert.strictEqual(yield* job.runWithRetries("2026-11-05"), "already-sent");
+      assert.strictEqual(h.mail.sent.length, 1);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("two runs started at once send one digest, the second exits", () => {
+    // Two cron entries (e.g. root's and the user's crontab) start two processes at 07:30.
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(NOV_5_09_00);
+      const job = yield* DigestJob;
+
+      const outcomes = yield* Effect.all(
+        [job.runWithRetries("2026-11-05"), job.runWithRetries("2026-11-05")],
+        { concurrency: "unbounded" },
+      );
+
+      assert.sameMembers([...outcomes], ["sent", "already-running"]);
+      assert.strictEqual(h.mail.sent.length, 1);
+      assert.strictEqual(h.model.requests.length, 1);
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a run that started after the first one finished finds the digest already sent", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(NOV_5_09_00);
+      const job = yield* DigestJob;
+
+      assert.strictEqual(yield* job.runWithRetries("2026-11-05"), "sent");
+      assert.strictEqual(yield* job.runWithRetries("2026-11-05"), "already-sent");
+    }).pipe(Effect.provide(h.layer));
+  });
+
+  it.effect("a run that died holding the claim blocks the day only until the claim expires", () => {
+    const h = harness();
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(NOV_5_09_00);
+      const job = yield* DigestJob;
+      const store = yield* Store;
+
+      // Claimed by a process that was killed before it could let go.
+      assert.isTrue(yield* store.claimRun("2026-11-05", NOV_5_09_00, 0));
+
+      assert.strictEqual(yield* job.runWithRetries("2026-11-05"), "already-running");
+      yield* TestClock.adjust(RUN_CLAIM_EXPIRY_MILLIS);
+      assert.strictEqual(yield* job.runWithRetries("2026-11-05"), "sent");
       assert.strictEqual(h.mail.sent.length, 1);
     }).pipe(Effect.provide(h.layer));
   });
